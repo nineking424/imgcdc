@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,12 +115,56 @@ func (d *Discoverer) scan() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	now := d.cfg.Now()
 	var out []string
 	for _, e := range entries {
 		if e.IsDir() || !d.cfg.Pattern.MatchString(e.Name()) {
 			continue
 		}
+		day, ok := parseDateFromName(e.Name())
+		if !ok {
+			continue
+		}
+		if !inWindow(day, now, d.cfg.Grace) {
+			continue
+		}
 		out = append(out, filepath.Join(d.cfg.LogDir, e.Name()))
 	}
 	return out, nil
+}
+
+func parseDateFromName(name string) (time.Time, bool) {
+	base := name
+	if i := strings.LastIndex(base, "."); i >= 0 {
+		base = base[:i]
+	}
+	if len(base) < 10 {
+		return time.Time{}, false
+	}
+	last := base[len(base)-10:]
+	if last[4] != '_' || last[7] != '_' {
+		return time.Time{}, false
+	}
+	y, err1 := strconv.Atoi(last[0:4])
+	m, err2 := strconv.Atoi(last[5:7])
+	dd, err3 := strconv.Atoi(last[8:10])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return time.Time{}, false
+	}
+	return time.Date(y, time.Month(m), dd, 0, 0, 0, 0, time.Local), true
+}
+
+// inWindow returns true if a file dated `fileDay` is still in the active tail
+// window at time `now`, given `grace` past midnight on the day-after.
+func inWindow(fileDay, now time.Time, grace time.Duration) bool {
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	yesterday := today.AddDate(0, 0, -1)
+	switch {
+	case fileDay.Equal(today):
+		return true
+	case fileDay.Equal(yesterday) && now.Sub(today) < grace:
+		return true
+	default:
+		return false
+	}
 }

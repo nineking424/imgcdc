@@ -46,9 +46,26 @@ func (t *Tailer) Run(ctx context.Context) error {
 	}
 	currentInode := inode.Of(info)
 
-	reader := bufio.NewReader(f)
-	var offset int64
+	var startOffset int64
+	saved, gerr := t.db.GetOffset(ctx, t.cfg.Path)
+	if gerr == nil {
+		if saved.Inode == currentInode {
+			startOffset = saved.Offset
+		} else {
+			slog.Info("inode mismatch on startup; restarting from 0",
+				"file", t.cfg.Path, "old_inode", saved.Inode, "new_inode", currentInode)
+		}
+	} else if !errors.Is(gerr, catalog.ErrNoOffset) {
+		return fmt.Errorf("get offset: %w", gerr)
+	}
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek: %w", err)
+	}
 
+	reader := bufio.NewReader(f)
+	offset := startOffset
+
+	var partial []byte
 	for {
 		select {
 		case <-ctx.Done():
@@ -58,6 +75,7 @@ func (t *Tailer) Run(ctx context.Context) error {
 
 		chunk, rerr := reader.ReadBytes('\n')
 		if errors.Is(rerr, io.EOF) {
+			partial = append(partial, chunk...)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -69,8 +87,11 @@ func (t *Tailer) Run(ctx context.Context) error {
 			return fmt.Errorf("read: %w", rerr)
 		}
 
-		offset += int64(len(chunk))
-		ev, perr := parser.Parse(string(chunk), t.cfg.Keyword, t.cfg.Separator, t.now)
+		complete := append(partial, chunk...)
+		partial = nil
+		offset += int64(len(complete))
+
+		ev, perr := parser.Parse(string(complete), t.cfg.Keyword, t.cfg.Separator, t.now)
 		if errors.Is(perr, parser.ErrNoMatch) {
 			continue
 		}

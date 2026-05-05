@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"imgcdc/internal/catalog"
+	"imgcdc/internal/inode"
 )
 
 func TestTailer_EmitsMatchedLines(t *testing.T) {
@@ -65,4 +66,97 @@ func TestTailer_EmitsMatchedLines(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Errorf("Run returned: %v", err)
 	}
+}
+
+func TestTailer_ResumesFromSavedOffset(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	line := "X DEFECTIMG.PARSE.OK : /tmp/a - /real/a\n"
+	seed := line + line
+	if err := os.WriteFile(logPath, []byte(seed), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, _ := catalog.Open(context.Background(), filepath.Join(dir, "c.db"))
+	defer db.Close()
+
+	info, _ := os.Stat(logPath)
+	pre := catalog.Record{
+		Path: "/real/a", EventTSNs: 1, LogFile: logPath,
+		Offset: int64(len(line)), Inode: inode.Of(info),
+	}
+	if err := db.WriteRecord(context.Background(), pre); err != nil {
+		t.Fatal(err)
+	}
+
+	out := make(chan catalog.Record, 4)
+	tlr := New(Config{Path: logPath, Keyword: "DEFECTIMG.PARSE.OK", Separator: " - ", Interval: 10 * time.Millisecond}, db, out)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- tlr.Run(ctx) }()
+
+	select {
+	case rec := <-out:
+		if rec.Offset != int64(2*len(line)) {
+			t.Errorf("Offset = %d, want %d", rec.Offset, 2*len(line))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no record")
+	}
+
+	select {
+	case extra := <-out:
+		t.Errorf("unexpected extra record: %+v", extra)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+	<-done
+}
+
+func TestTailer_DoesNotEmitPartialLine(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	if err := os.WriteFile(logPath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, _ := catalog.Open(context.Background(), filepath.Join(dir, "c.db"))
+	defer db.Close()
+	out := make(chan catalog.Record, 4)
+	tlr := New(Config{Path: logPath, Keyword: "DEFECTIMG.PARSE.OK", Separator: " - ", Interval: 10 * time.Millisecond}, db, out)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- tlr.Run(ctx) }()
+
+	f, _ := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0644)
+	f.WriteString("X DEFECTIMG.PARSE.OK : /tmp/a - /real/a")
+	f.Sync()
+
+	select {
+	case rec := <-out:
+		t.Fatalf("partial line was emitted: %+v", rec)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	f.WriteString("\nY DEFECTIMG.PARSE.OK : /tmp/b - /real/b\n")
+	f.Close()
+
+	var got []string
+	for i := 0; i < 2; i++ {
+		select {
+		case rec := <-out:
+			got = append(got, rec.Path)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout for completed lines")
+		}
+	}
+	if got[0] != "/real/a" || got[1] != "/real/b" {
+		t.Errorf("got %v", got)
+	}
+
+	cancel()
+	<-done
 }

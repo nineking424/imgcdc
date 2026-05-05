@@ -160,3 +160,55 @@ func TestTailer_DoesNotEmitPartialLine(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestTailer_DetectsInodeRotation(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	line := "X DEFECTIMG.PARSE.OK : /tmp/x - /real/first\n"
+	if err := os.WriteFile(logPath, []byte(line), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, _ := catalog.Open(context.Background(), filepath.Join(dir, "c.db"))
+	defer db.Close()
+
+	out := make(chan catalog.Record, 4)
+	tlr := New(Config{Path: logPath, Keyword: "DEFECTIMG.PARSE.OK", Separator: " - ", Interval: 10 * time.Millisecond}, db, out)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- tlr.Run(ctx) }()
+
+	select {
+	case rec := <-out:
+		if rec.Path != "/real/first" {
+			t.Errorf("Path = %q", rec.Path)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no first record")
+	}
+
+	newLine := "Y DEFECTIMG.PARSE.OK : /tmp/y - /real/second\n"
+	tmp := logPath + ".new"
+	if err := os.WriteFile(tmp, []byte(newLine), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, logPath); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case rec := <-out:
+		if rec.Path != "/real/second" {
+			t.Errorf("Path = %q, want /real/second", rec.Path)
+		}
+		if rec.Offset != int64(len(newLine)) {
+			t.Errorf("Offset = %d, want %d", rec.Offset, len(newLine))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no second record after rotation")
+	}
+
+	cancel()
+	<-done
+}

@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS tail_offsets (
 `
 
 var pragmas = []string{
-	"PRAGMA journal_mode = WAL",
 	"PRAGMA synchronous = NORMAL",
 	"PRAGMA wal_autocheckpoint = 10000",
 	"PRAGMA foreign_keys = OFF",
@@ -40,7 +39,14 @@ var pragmas = []string{
 }
 
 func Open(ctx context.Context, path string) (*DB, error) {
-	sdb, err := sql.Open("sqlite", path)
+	// Set journal_mode and busy_timeout via DSN so they apply at connection
+	// open time. journal_mode=WAL needs to be set before any other connection
+	// attaches in non-WAL mode; doing it inline here avoids a race where a
+	// concurrent reader (e.g., a test polling the same file) prevents the
+	// later `PRAGMA journal_mode=WAL` from acquiring the EXCLUSIVE lock and
+	// hangs the call.
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	sdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}

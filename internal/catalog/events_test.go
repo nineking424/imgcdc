@@ -68,3 +68,28 @@ func TestWriteRecord_OffsetReplacesPriorValue(t *testing.T) {
 		t.Errorf("event count = %d, want 2", count)
 	}
 }
+
+func TestWriteRecord_RollsBackEventOnOffsetFailure(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Force the second statement to fail by dropping the tail_offsets table.
+	// The INSERT into file_events will succeed, but the UPSERT into
+	// tail_offsets will return an error, exercising the deferred Rollback.
+	if _, err := db.sql.ExecContext(ctx, `DROP TABLE tail_offsets`); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+
+	rec := Record{Path: "/p", EventTSNs: 1, LogFile: "/log", Offset: 1, Inode: 1}
+	if err := db.WriteRecord(ctx, rec); err == nil {
+		t.Fatal("WriteRecord: want error, got nil")
+	}
+
+	var count int
+	if err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_events`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("file_events count = %d, want 0 (rollback should have undone insert)", count)
+	}
+}

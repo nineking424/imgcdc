@@ -1,0 +1,59 @@
+site_name: imgcdc
+site_description: ETL 처리 로그 polling-tail CDC 데몬
+site_url: https://nineking424.github.io/imgcdc/
+repo_url: https://github.com/nineking424/imgcdc
+repo_name: nineking424/imgcdc
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: ko
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 다크 모드로 전환
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 라이트 모드로 전환
+
+nav:
+  - 홈: index.md
+  - Concepts:
+      - Architecture: concepts/architecture.md
+      - Catalog Schema: concepts/catalog-schema.md
+  - Operating:
+      - Configuration: operating/configuration.md
+      - Deployment: operating/deployment.md
+      - Runbook: operating/runbook.md
+      - Troubleshooting: operating/troubleshooting.md
+  - Consumer:
+      - Guide: consumer/guide.md
+  - Developer:
+      - Code Map: developer/code-map.md
+      - Testing: developer/testing.md
+
+exclude_docs: |
+  superpowers/
+
+markdown_extensions:
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true

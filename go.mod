@@ -2,7 +2,10 @@ module imgcdc
 
 go 1.25.6
 
-require modernc.org/sqlite v1.50.0
+require (
+	golang.org/x/sync v0.20.0
+	modernc.org/sqlite v1.50.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

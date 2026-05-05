@@ -1,0 +1,706 @@
+================================================================================
+PRD — imgcdc (ETL Image Info-File CDC via Log Tailing)
+LOG-TAIL ARCHITECTURE
+================================================================================
+
+Version      : 3.0
+Status       : Draft
+Owner        : Platform Engineering
+Project Name : imgcdc
+Architecture : POSIX log file polling-tail + SQLite WAL catalog
+Last Updated : 2026-05-06
+
+History
+-------
+v1.0  fanotify fd-mode (검토 후 폐기 — fd leak / procfs / tail latency)
+v2.0  fanotify FID-mode (검토 후 폐기 — RHEL 6.10 kernel 2.6.32 에 부재)
+v3.0  log-tailing (현재) — 운영 OS 제약 + 정책 제약을 모두 충족하는 유일 경로
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+Goal
+----
+imgcdc는 ETL 시스템이 생성하는 info 파일(이미지 결함 분석 PK 파일)의 출현
+이벤트를 ETL 처리 로그에서 추출해 append-only CDC catalog 로 기록한다.
+외부 readonly consumer 는 catalog 를 follow 하여 새 info 파일을 분 단위로
+발견하고 후속 처리(DB lookup → real data file fetch)를 수행한다.
+
+Approach
+--------
+- 이벤트 소스      : 50 개 가량의 ETL worker 처리 로그 파일
+                    (etl_defectimg_workNN_YYYY_MM_DD.log)
+- 검출 방법        : polling-based file tail + 키워드 매칭
+                    ("DEFECTIMG.PARSE.OK") + real path 추출
+- 영속화           : SQLite WAL catalog (file_events 테이블)
+- 분배             : consumer 가 catalog 를 직접 SELECT (delta CDC)
+- 배포             : 단일 정적 ELF (CGO_ENABLED=0)
+
+Why this approach
+-----------------
+1. 운영 OS 가 RHEL 6.10 (kernel 2.6.32) 으로 고정 — fanotify FID 모드 /
+   FAN_DELETE 등 directory entry events 가 부재. v2.0 PRD 의 FID-FIRST
+   설계는 타겟 OS 에서 동작 불가.
+2. inotify 는 가능하나 운영 정책상 커널 notification 사용 불가.
+3. info 파일은 처리 로그에 OK 라인으로 정확히 기록되며, 그 라인은 파일이
+   read-safe 한 시점에 작성된다 → 로그가 신뢰 가능한 1 차 소스.
+4. 추적 대상은 일 5,000 건 수준이라 polling-tail 의 부하/지연이 무관.
+
+Key non-goals (vs v2.0 PRD)
+---------------------------
+- fanotify, FID, file_handle, open_by_handle_at, /proc/self/fd
+- inotify
+- ring buffer (lock-free MPSC) — Go channel 로 대체
+- worker pool, batch insert — 부하가 작아 단일 goroutine + per-event commit
+- 디렉토리 traversal / cold-start 스캔 (info 파일 전체가 아닌 새 출현만 추적)
+- DELETE 이벤트 (소스에 부재)
+- 메트릭 / 관측 (운영 정책상 제외)
+- 카탈로그 retention cleanup (MVP 미구현, 운영 후 재평가)
+
+================================================================================
+2. PROBLEM STATEMENT
+================================================================================
+
+Existing system
+---------------
+다수의 ETL worker process (통상 50 개) 가 동시에 동작하며 각각 개별 로그
+파일에 처리 결과를 append 한다. info 파일 (DB PK 를 담은 작은 metadata
+파일) 이 처리 완료 시점에 디스크에 commit 되고, 동시에 처리 로그에
+"DEFECTIMG.PARSE.OK" 라인이 기록된다.
+
+Downstream needs
+----------------
+별도 후속 시스템이 향후 구축될 예정. 다음을 필요로 한다:
+- 새 info 파일의 실시간(분 단위) 인지
+- 동일 이벤트를 여러 consumer 가 독립적으로 follow
+- consumer 가 자신의 처리 진행도(seq_id)를 직접 관리
+- 파일시스템 polling 비용 회피
+
+OS / runtime constraints (불변)
+------------------------------
+- 운영 OS         : RHEL 6.10 (kernel 2.6.32, glibc 2.12)
+- 커널 notify     : inotify / fanotify 사용 불가 (정책)
+- 데몬 supervision: sysvinit / upstart (systemd 없음)
+- 메트릭 인프라   : 미연동 (정책)
+- 빌드 환경       : macOS dev → RHEL 6.10 deploy
+- 배포 형태       : 단일 정적 ELF, glibc 의존 0
+
+Why polling-tail
+----------------
+v1.0(fd-mode) / v2.0(FID-mode) fanotify 모두 RHEL 6.10 에서 fundamentally
+불가능. inotify 는 가능하지만 정책상 사용 불가. 처리 로그가 모든 추적 대상
+이벤트를 정확히 담고 있으므로 로그가 가장 신뢰 가능한 1 차 소스이며,
+polling-tail 의 부하는 5,000 line/day 부하에서 무시 가능.
+
+================================================================================
+3. PRODUCT GOALS
+================================================================================
+
+Functional
+----------
+1. 50 개 가변 ETL 처리 로그 파일을 polling-tail
+2. "DEFECTIMG.PARSE.OK" 키워드 매칭 라인에서 real path 추출
+3. (path, ts) 를 append-only catalog (SQLite WAL) 에 기록
+4. 다수 readonly consumer 의 catalog follow 지원
+5. 데몬 재시작 시 마지막 처리 위치에서 정확히 재개 (no-loss / no-dup)
+6. 파일시스템 traversal / cold-start 스캔 미사용
+
+Non-functional
+--------------
+Event Latency (hot, today) :  <= 5 minutes (목표 < 30 sec)
+Event Latency (any)        :  <= 5 minutes
+Throughput Headroom        :  peak 100 evt/s 까지 안전
+Event Loss                 :  0 (단, ETL 로그가 정확히 기록된다는 가정 하)
+Daemon Uptime              :  365 days
+Consumer Count             :  >= 10
+Recovery Time (graceful)   :  < 5 sec
+Recovery Time (crash)      :  < 30 sec
+
+================================================================================
+4. SCOPE
+================================================================================
+
+In Scope
+--------
+- info 파일의 출현(create/commit) 이벤트 추적
+- 위 이벤트의 SQLite catalog 기록 (append-only)
+- 다수 consumer 의 follow 지원
+- 데몬 재시작 안전성
+
+Out of Scope
+------------
+- 파일 삭제 (DELETE) 이벤트 (소스 부재)
+- 파일 변경 (MODIFY) 이벤트 (info 파일은 immutable 가정)
+- info 파일 내용 파싱
+- DB 조회 / real image file 결정 (별도 시스템)
+- 카탈로그 retention cleanup (MVP 후 재평가)
+- 메트릭 / 관측 (정책 제외)
+- HTTP API / RPC
+- 배포 자동화 / CI/CD
+- fanotify / inotify 백엔드
+- 파일시스템 디렉토리 traversal
+
+================================================================================
+5. SOURCE LOG FORMAT
+================================================================================
+
+File location
+-------------
+- 디렉토리        : CLI --log-dir 로 지정
+- 파일명 패턴      : etl_defectimg_workNN_YYYY_MM_DD.log
+                    NN       : worker number (01~50, 가변)
+                    YYYY_MM_DD: 처리 시작 일자
+
+Lifecycle
+---------
+- 일자 별로 새 파일이 생성됨
+- 처리 1 건 = 1 라인 append
+- truncate / rotate 없음
+- 처리 단위 소요 시간 <= 1 시간
+  → 자정 직전에 시작한 작업이 자정 이후까지 쓰는 라인은 *전날 날짜 파일*
+    에 기록됨
+  → imgcdc 는 어제 날짜 파일을 grace 기간(default 90 분)동안 추가 tail
+
+Line format
+-----------
+예:
+  2026-05-06 14:23:01.234 INFO [load] DEFECTIMG.PARSE.OK : /tmp/x.info - /real/path/x.info
+
+구조:
+  <YYYY-MM-DD HH:MM:SS.fff> INFO [load] <KEYWORD> : <temp_path> - <real_path>
+
+Filter rule
+-----------
+- 라인이 키워드 "DEFECTIMG.PARSE.OK" 를 포함하면 매칭
+- 매칭 라인에서 real_path = " - " 로 구분된 두 번째(=마지막) path
+- temp_path 는 무시
+
+Volume
+------
+- 평균 : ~5,000 line/day (전 워커 합산) ≈ 0.06 line/s
+- 피크 : 시간당 수백 line 수준
+
+Assumptions
+-----------
+- 한 라인 = 한 이벤트 (멀티라인 없음)
+- 한 파일은 단일 worker process 가 append → 라인 interleave 없음
+- 라인 작성 시점에 real_path 는 read-safe
+- 파일 끝에 partial line 가능 (write 분할) → tailer 는 newline 종료 라인만 처리
+
+================================================================================
+6. HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+  ETL workers (외부, imgcdc 가 건드리지 않음)
+              │
+              v  append
+   /var/log/etl/etl_defectimg_workNN_YYYY_MM_DD.log
+              │
+       ┌──────┴───────────────────────────────┐
+       │  imgcdc daemon (single static ELF)    │
+       │                                       │
+       │  ┌── log-discovery (1 goroutine) ────┐│
+       │  │  - 1 초 주기 glob                 ││
+       │  │  - 신규/만료 파일에 대해           ││
+       │  │    tailer goroutine spawn/retire   ││
+       │  └────────┬───────────────────────────┘│
+       │           │                            │
+       │           v                            │
+       │  ┌── per-file tailer (~50)            ┐│
+       │  │  - bufio.Scanner                   ││
+       │  │  - keyword filter                  ││
+       │  │  - real path 추출                  ││
+       │  │  - byte offset 추적 (in-memory)    ││
+       │  │  - inode rotation 검출             ││
+       │  └────────┬───────────────────────────┘│
+       │           │  chan Event (buf 256)      │
+       │           v                            │
+       │  ┌── writer (1 goroutine) ────────────┐│
+       │  │  per-event SQLite txn:             ││
+       │  │   INSERT file_events               ││
+       │  │   UPSERT tail_offsets              ││
+       │  │   COMMIT                           ││
+       │  └────────────────────────────────────┘│
+       │                                       │
+       │  signal handler (SIGTERM/SIGINT)      │
+       │  - errgroup + context cancel          │
+       └───────────────────────────────────────┘
+              │
+              v
+        SQLite WAL: catalog.db
+              │
+       ┌──────┼──────┐ ...
+       v      v      v
+    consumer A,B,...,N (별 프로세스)
+
+Key design principles
+---------------------
+1. Single writer. tailer 는 SQLite 를 직접 건드리지 않고 채널로만 통신.
+2. 모든 영속 상태는 SQLite. tailer 는 in-memory 상태(현재 offset) 만 가짐.
+3. (catalog INSERT + offset UPSERT) 은 같은 transaction 으로 commit.
+   crash 시 자동 rollback → 재기동 시 정확히 같은 위치에서 재개.
+   0 loss, 0 duplicate.
+4. 디스커버리는 polling glob (커널 notify 없음).
+5. context.Context + errgroup 으로 lifecycle 일관 관리.
+
+What is NOT in this architecture
+--------------------------------
+- ring buffer 추상화        (Go channel 이 그 역할)
+- worker pool               (5000/day 부하에 무의미)
+- batch insert 로직         (per-event commit)
+- 메트릭/관측 컴포넌트       (정책 제외)
+- DELETE / MODIFY 처리       (소스 부재 / 가정 immutable)
+- cold-start 디렉토리 스캔   (backfill 없음)
+- inotify / fanotify 의존   (사용 불가)
+
+================================================================================
+7. COMPONENT DESIGN
+================================================================================
+
+7.1 LOG DISCOVERY
+================================================================================
+
+Responsibilities
+- 지정 디렉토리에서 파일명 패턴 매칭 파일 목록 구성
+- 어제(grace) / 오늘 날짜 범위만 대상
+- 신규 파일 등장 → tailer goroutine spawn
+- 만료 파일 (자정 + grace 경과 + EOF stable) → tailer retire 신호
+
+Polling cadence
+- 1 초 (CLI --discovery-interval, default 1s)
+
+Grace policy
+- 어제 날짜의 파일은 today 00:00 + grace 시점까지 유지
+- default --grace = 90 minutes (ETL 작업 1h 한도 + 30m 안전 마진)
+- grace 경과 + 60 초간 EOF 유지 → tailer 종료
+
+
+7.2 PER-FILE TAILER
+================================================================================
+
+Responsibilities
+- 파일 open + 마지막 offset 으로 seek
+- bufio.Scanner 로 라인 read
+- 라인 키워드 매치 → real path 추출 → Event 생성 → 채널 send
+- partial line 처리 (newline 미포함 → 다음 read 까지 보류)
+- inode 검증: 주기적 stat() 비교, inode 변경 감지 시 reopen + offset 0
+
+State (in-memory only)
+- file path
+- current byte offset (writer 가 SQLite 에 커밋)
+- file inode
+
+Polling cadence
+- read until EOF → sleep 1s → re-read (CLI --tail-interval, default 1s)
+
+Single-goroutine guarantees
+- 한 파일 = 항상 하나의 goroutine
+- discovery 가 spawn/retire 신호만 담당
+- tailer lifecycle = context cancel + EOF stable 조건
+
+
+7.3 PARSER
+================================================================================
+
+라인을 받아 (keyword 매칭, real path 추출) 까지 수행.
+tailer 안에서 호출되는 순수 함수.
+
+Logic (의사코드)
+  if !contains(line, "DEFECTIMG.PARSE.OK"):
+      return nil
+  // " - " 다음의 마지막 토큰이 real_path
+  parts = split(line, " - ")
+  if len(parts) < 2:
+      return error("malformed line")
+  real_path = trim(parts[len-1])
+  if !path.IsAbs(real_path):
+      return error("not absolute path")
+  return Event{path: real_path, ts: now()}
+
+타임스탬프
+- v3.0 MVP: 라인 수신 시점의 wall clock (now()) 을 event_ts_ns 로 사용
+  → 단순. 라인 안의 timestamp 는 timezone 의존성 회피
+- 향후 확장: 라인 timestamp 파싱 옵션
+
+Malformed lines
+- 키워드 매칭이지만 형식 깨진 경우: warning log + skip
+
+
+7.4 WRITER
+================================================================================
+
+Responsibilities
+- chan Event 를 drain
+- 각 Event 에 대해 단일 SQLite transaction:
+    BEGIN
+    INSERT INTO file_events (event_type, path, event_ts_ns)
+                     VALUES (1, ?, ?)
+    INSERT OR REPLACE INTO tail_offsets (file, offset, inode, updated_ns)
+                                 VALUES (?, ?, ?, ?)
+    COMMIT
+- per-event commit (5,000/day 부하면 batch 의 의미 없음)
+- ctx.Done() 시 채널 drain 끝까지 처리하고 종료
+
+Crash atomicity
+- WAL + per-event txn → catalog row 가 보였다면 그 라인의 offset 도 같이
+  commit. 보이지 않으면 그 라인은 다시 처리됨 (at-least-once delivery).
+
+
+7.5 SIGNAL HANDLER
+================================================================================
+
+- SIGTERM, SIGINT 수신 시 root context cancel
+- discovery → tailers → writer 순으로 graceful shutdown
+- shutdown timeout 5s (--shutdown-timeout), 초과 시 강제 종료
+- SIGHUP 미지원 (CLI 변경은 재시작으로 충분)
+
+
+================================================================================
+8. CATALOG SCHEMA
+================================================================================
+
+Storage
+- SQLite, 단일 DB 파일
+- CLI --db, default /var/lib/imgcdc/catalog.db
+
+Pragmas
+-------
+PRAGMA journal_mode    = WAL;
+PRAGMA synchronous     = NORMAL;
+PRAGMA wal_autocheckpoint = 10000;
+PRAGMA foreign_keys    = OFF;
+PRAGMA user_version    = 1;
+
+Tables
+------
+
+CREATE TABLE file_events (
+    seq_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type  INTEGER NOT NULL,           -- 1 = UPSERT (forward-compat)
+    path        TEXT    NOT NULL,           -- absolute real path
+    event_ts_ns INTEGER NOT NULL            -- nanoseconds since unix epoch
+);
+
+CREATE INDEX idx_file_events_path ON file_events(path);
+
+CREATE TABLE tail_offsets (
+    file        TEXT PRIMARY KEY,           -- absolute log file path
+    offset      INTEGER NOT NULL,           -- 다음에 읽기 시작할 byte
+    inode       INTEGER NOT NULL,           -- rotation 검출용
+    updated_ns  INTEGER NOT NULL
+);
+
+Sizing
+------
+- 5,000 row/day × ~130 byte avg ≈ 650 KB/day
+- 1 년 운영 시 ~240 MB. SQLite 가 무리없이 다룸.
+
+Schema versioning
+-----------------
+- PRAGMA user_version = 1
+- 향후 변경 시 migration step 추가
+
+================================================================================
+9. CONSUMER MODEL
+================================================================================
+
+Read-only access
+- consumer 는 catalog.db 를 독립 SQLite connection 으로 SELECT 만 수행
+- WAL 덕에 imgcdc 가 쓰는 동안 reader block 없음
+
+Consumption query
+-----------------
+SELECT seq_id, event_type, path, event_ts_ns
+FROM file_events
+WHERE seq_id > :last_seen_seq_id
+ORDER BY seq_id
+LIMIT :batch_size;
+
+State
+-----
+각 consumer 는 자신의 last_seen_seq_id 를 자체 영속화.
+
+Delivery guarantee
+- At-least-once
+- consumer 는 idempotent 처리 필요 (path 기준 dedup 권장)
+
+Ordering guarantee
+- Per-DB total ordering (seq_id 단조 증가)
+
+Required handling on consumer side
+- 동일 path 가 여러 row 로 등장 가능 (재처리 / late-arriving)
+- 처리 시점에 파일이 이미 사라졌을 가능성 → ENOENT 처리 필수
+
+================================================================================
+10. CONFIGURATION
+================================================================================
+
+모두 CLI 인자. 설정 파일 / 환경변수 없음.
+
+Required
+--------
+--log-dir <path>            로그 디렉토리 (예: /var/log/etl)
+--db <path>                 SQLite catalog 경로
+
+Optional (default 표시)
+----------------------
+--file-pattern <regex>      파일명 패턴
+                            default:
+                            ^etl_defectimg_work\d+_\d{4}_\d{2}_\d{2}\.log$
+--keyword <string>          매칭 키워드
+                            default: DEFECTIMG.PARSE.OK
+--path-separator <string>   real path 구분자 (default: " - ")
+--discovery-interval <dur>  default 1s
+--tail-interval      <dur>  default 1s
+--grace              <dur>  default 90m
+--shutdown-timeout   <dur>  default 5s
+--log-level          <str>  default info  (debug|info|warn|error)
+
+Examples
+--------
+imgcdc \
+  --log-dir /var/log/etl \
+  --db /var/lib/imgcdc/catalog.db
+
+imgcdc \
+  --log-dir /var/log/etl \
+  --db /var/lib/imgcdc/catalog.db \
+  --grace 2h \
+  --tail-interval 500ms
+
+================================================================================
+11. RECOVERY & FAILURE HANDLING
+================================================================================
+
+Daemon restart (graceful or crash)
+----------------------------------
+1. SQLite WAL 자동 복구 (committed txn 보존, partial discarded)
+2. tail_offsets 에서 각 파일의 마지막 offset 복원
+3. 파일 stat()
+   - 현재 inode == 저장된 inode → 그 offset 으로 seek 후 재개
+   - inode 변경 → 회전된 것으로 간주, offset 0 부터
+4. 파일이 사라짐 → tail_offsets row 제거, skip
+
+Log rotation / file replacement
+-------------------------------
+- 본 시스템은 일자별 새 파일 + 기존 파일 보존이 표준
+- 회전을 가정하지 않지만 inode 검증을 안전망으로 유지
+
+ETL log gaps (외부 원인)
+------------------------
+- ETL 디스크 풀 / 워커 크래시 등으로 라인이 안 쓰인 경우 imgcdc 는 알 수 없음
+- 0 loss 보증의 외부 의존: "ETL 로그가 정확히 작성됨"
+- 향후 reconciliation 옵션 가능 — 본 PRD scope 밖
+
+SQLite write failure
+--------------------
+- 디스크 풀 / 권한 / 손상 → writer panic → graceful shutdown
+- supervisor 가 자동 재시작
+- 재시작 시 commit 되지 않은 라인은 자동 재처리
+
+Channel saturation
+------------------
+- chan Event buffer 256, 0.06 evt/s 부하에서 도달 거의 불가
+- saturation 시 tailer send block → polling stall → 자동 backpressure
+- 데이터 손실 없음
+
+Partial line at file end
+------------------------
+- bufio.Scanner 가 newline 종료 라인만 emit
+- 미완성 라인은 다음 read 사이클에서 합쳐 처리
+
+================================================================================
+12. BUILD & DEPLOYMENT
+================================================================================
+
+Toolchain
+---------
+- Go 1.22+ (build host: macOS or Linux)
+
+Dependencies
+------------
+- modernc.org/sqlite     (pure Go SQLite, CGO 불필요)
+- 표준 라이브러리         (flag, os/signal, bufio, regexp, time, log/slog)
+
+Build command
+-------------
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-s -w" \
+    -o bin/imgcdc \
+    ./cmd/imgcdc
+
+Output
+------
+- 단일 정적 ELF (~10–15 MB)
+- glibc 의존성 0 (RHEL 6.10 ~ 최신까지 모두 동작)
+
+Project layout
+--------------
+imgcdc/
+  cmd/
+    imgcdc/
+      main.go
+  internal/
+    discovery/
+    tailer/
+    parser/
+    writer/
+    catalog/
+  test/
+    integration/
+  Makefile
+  go.mod
+  PRD.txt
+
+Daemon supervision
+------------------
+- upstart job 또는 init.d 스크립트
+- imgcdc 자체는 fork/detach 없음 (foreground 단일 프로세스)
+- stdout/stderr → supervisor 가 캡처
+
+Example upstart job (/etc/init/imgcdc.conf)
+-------------------------------------------
+description "imgcdc daemon"
+start on runlevel [2345]
+stop on runlevel [!2345]
+respawn
+respawn limit 10 60
+exec /usr/local/bin/imgcdc \
+     --log-dir /var/log/etl \
+     --db /var/lib/imgcdc/catalog.db
+
+Required filesystem
+-------------------
+/usr/local/bin/imgcdc      실행 파일
+/var/lib/imgcdc/           DB 디렉토리, mode 0750
+/var/log/etl/              소스 로그, read 권한 필요
+
+================================================================================
+13. TESTING
+================================================================================
+
+Unit tests (macOS or Linux)
+---------------------------
+- parser   : 정상/malformed/키워드 미스/두 path 추출
+- discovery: 가짜 디렉토리에서 패턴 + 날짜 필터 검증
+- writer   : in-memory SQLite 로 INSERT + UPSERT 원자성 검증
+- offset 복구: 파일 일부 읽다 중단 → 재시작 시 이어 읽기 검증
+
+Integration tests (CentOS 6 / RHEL 6 호환 컨테이너)
+-------------------------------------------------
+- 실 SQLite WAL + 실 파일 tail 시나리오
+- 자정 grace 동작 (테스트용 시계/grace 단축)
+- inode rotation 검출
+- crash injection: kill -9 → 재기동 시 0 loss / 0 dup
+- graceful shutdown: 채널 drain 후 종료
+
+Out of scope for MVP
+- 운영 머신 자체에서의 부하 테스트 (별도 사내 검증)
+
+================================================================================
+14. SUCCESS CRITERIA
+================================================================================
+
+MVP
+---
+1. RHEL 6.10 에서 단일 정적 ELF 로 동작
+2. 50 개 동시 로그 파일 polling-tail
+3. DEFECTIMG.PARSE.OK 라인의 real path 가 5 분 이내 catalog 에 등장
+4. 데몬 재시작/크래시 후 마지막 처리 위치에서 정확히 재개 (수동 검증)
+5. 다수 readonly consumer 가 catalog 를 동시 follow 가능 (WAL)
+6. 24 시간 연속 실행 시 의도치 않은 종료 / 데이터 불일치 없음
+
+Operational success (운영 후 1 개월)
+----------------------------------
+1. catalog 크기 모니터링 → retention 도입 시점 판단
+2. 365 일 무중단 가동 가능성 검증
+3. consumer 다양성 / lag 패턴 관찰
+
+================================================================================
+15. EXPLICITLY EXCLUDED
+================================================================================
+
+다음은 의도적으로 제외 / 폐기. 추후 필요 시 재논의.
+
+From v2.0 PRD (FID-FIRST design)
+- fanotify, FAN_REPORT_FID, FAN_REPORT_DFID_NAME
+- file_handle, open_by_handle_at, /proc/self/fd
+- ring buffer (lock-free MPSC)
+- worker pool sizing by CPU cores
+- batch insert / 100ms flush
+- directory traversal (cold-start scan)
+
+From design discussion
+- inotify 백엔드 (운영 정책상 제외)
+- DELETE 이벤트 추적 (소스 부재)
+- file MODIFY 이벤트
+- 메트릭 (Prometheus textfile / HTTP / 로그) — 운영 정책상 제외
+- 카탈로그 retention cleanup (MVP 미구현, 운영 후 재평가)
+- HTTP API
+- 구성 파일 (모든 설정은 CLI)
+- 라인 timestamp 파싱 (MVP 는 wall clock 사용)
+- reconciliation scan (filesystem 과 catalog 일치 검증)
+- 분산 / 다중 노드 / 복제
+
+================================================================================
+16. APPENDIX — DECISION LOG
+================================================================================
+
+D-001  Language = Go
+       대안 검토: Rust, Python, C, Java, Node
+       선택 사유: 정적 단일 바이너리(CGO_ENABLED=0), macOS→RHEL6 cross
+       한 줄, stdlib 완비. 부하/지연 요건이 낮아 시스템 언어 이득 없음.
+       운영 단순성이 우선.
+
+D-002  SQLite driver = modernc.org/sqlite
+       대안: mattn/go-sqlite3 (CGO)
+       선택 사유: CGO 불필요 → glibc 2.12 의존성 회피, 단일 정적 ELF.
+       성능 차이는 5,000/day 부하에서 무관.
+
+D-003  Event source = ETL 처리 로그 polling-tail
+       대안: fanotify FID (v2.0), inotify
+       선택 사유: 타겟 OS / 운영 정책상 양쪽 모두 사용 불가.
+
+D-004  No DELETE event
+       이유: 처리 로그에 삭제 정보 없음. consumer 는 ENOENT 로 판단.
+
+D-005  Per-event commit (no batch)
+       이유: 0.06 evt/s 에서 batch 의 의미 없음.
+
+D-006  Schema = minimal (seq_id, event_type, path, event_ts_ns)
+       이유: stat() 으로 얻을 size/mtime/inode 가 catalog 의 1 차 가치
+       에 기여하지 않음. 필요 시 consumer 가 직접 stat.
+
+D-007  No catalog retention cleanup in MVP
+       이유: 5,000/day × 1y ≈ 1.8M row, ~240MB. SQLite 가 무리없이 다룸.
+       도입 비용 < 효익이 명확해질 때 재논의.
+
+D-008  No metrics
+       이유: 운영 정책상 제외. 운영 검증은 stdout 로그 + ad-hoc 쿼리.
+
+D-009  All config via CLI
+       이유: 단일 ETL 시스템 전용, 설정 종류 적음. upstart job 에 명시.
+
+D-010  Daemon = foreground + supervisor
+       이유: RHEL 6.10 = sysvinit/upstart. supervisor 위임이 단순.
+
+D-011  Build = CGO_ENABLED=0 정적 ELF
+       이유: glibc 2.12 의존 회피, 단일 파일 배포.
+
+D-012  Process model = goroutine per log file + 1 writer + 1 discovery
+       이유: 50 goroutine 은 Go 에서 무비용. 파일 간 isolation, 단순한
+       lifecycle, channel 기반 단일 writer.
+
+D-013  Channel buffer 256 (vs PRD §9.2 65536)
+       이유: 0.06 evt/s 에서 256 도 과대. lock-free MPSC 추상화 불필요.
+
+D-014  Grace tail = 90 minutes (vs ETL 작업 1h 한도)
+       이유: 1h 한도 + 30m 안전 마진. CLI 로 조정 가능.
+
+D-015  event_ts_ns = wall clock at line read (vs 라인 timestamp 파싱)
+       이유: timezone / 형식 의존성 회피. 향후 옵션 추가 가능.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

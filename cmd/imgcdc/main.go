@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,6 +23,17 @@ const (
 	defaultSeparator = " - "
 )
 
+// Build-time injected via -ldflags "-X main.version=... -X main.commit=... -X main.date=..."
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "imgcdc %s (commit %s, built %s)\n", version, commit, date)
+}
+
 func main() {
 	var (
 		logDir            = flag.String("log-dir", "", "directory containing ETL log files (required)")
@@ -34,8 +46,14 @@ func main() {
 		grace             = flag.Duration("grace", 90*time.Minute, "yesterday-file grace window")
 		shutdownTimeout   = flag.Duration("shutdown-timeout", 5*time.Second, "graceful shutdown timeout")
 		logLevel          = flag.String("log-level", "info", "debug|info|warn|error")
+		showVersion       = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		printVersion(os.Stdout)
+		return
+	}
 
 	if *logDir == "" || *dbPath == "" {
 		fmt.Fprintln(os.Stderr, "imgcdc: --log-dir and --db are required")
